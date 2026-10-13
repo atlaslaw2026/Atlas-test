@@ -1,4 +1,9 @@
-# Docket Publication Gate - GitHub Actions workflow (v1.2.1, final-test-prep hardening).
+# Docket Publication Gate - GitHub Actions workflow (v1.2.2, pre-boundary privacy).
+# v1.2.2 changes vs v1.2.1: the name blocklist is supplied as SALTED HASHES
+# (DOCKET_NAME_BLOCKLIST_HASHES: `salt:<hex>` then `<severity>:<hexhmac>` per
+# name, produced by provision-blocklist-hashes.py). Plaintext blocklisted
+# names never exist on the runner. See .docket-gate/validator.py for the
+# matching-semantics parity argument. All other checks are v1.2.1-identical.
 # v1.2.1 changes vs v1.2.0: third-party actions pinned to verified full commit
 # SHAs (actions/checkout@v4 -> 11d5960a326750d5838078e36cf38b85af677262).
 #
@@ -12,9 +17,14 @@
 #   .docket-gate/filing-types.json
 #   publication-manifest.json  (at PR head root; one per PR; see manifest.schema.json)
 #
-# THE BLOCKLIST IS NEVER IN THE REPO. It is supplied as the repository secret
-# DOCKET_NAME_BLOCKLIST (one name per line). The validator FAILS CLOSED if the
-# secret is missing or empty - no secret, no publication.
+# THE BLOCKLIST IS NEVER IN THE REPO, AND PLAINTEXT NAMES NEVER REACH THE
+# RUNNER. The name check is supplied as the repository secret
+# DOCKET_NAME_BLOCKLIST_HASHES (one `salt:<hex>` line, then one
+# `<severity>:<hexhmac>` line per name; see provision-blocklist-hashes.py).
+# The validator FAILS CLOSED if the secret is missing or empty - no secret,
+# no publication. This is the B2 (branch->master) backstop; the B1
+# (pre-egress, agent-side) scan in push-with-checklist.py is the primary
+# privacy enforcement point.
 #
 # SECURITY DESIGN (v1.2.0 fixes):
 # - Trigger is pull_request_target, NOT pull_request. The workflow DEFINITION
@@ -139,17 +149,17 @@ jobs:
             || { echo "::error::publication-manifest.json is not valid JSON. Blocking."; exit 1; }
           echo "manifest=publication-manifest.json" >> "$GITHUB_OUTPUT"
 
-      - name: Materialize the name blocklist from secret (fail closed)
+      - name: Materialize the name blocklist hashes from secret (fail closed)
         if: steps.selfchange.outputs.self_change == 'false'
         env:
-          DOCKET_NAME_BLOCKLIST: ${{ secrets.DOCKET_NAME_BLOCKLIST }}
+          DOCKET_NAME_BLOCKLIST_HASHES: ${{ secrets.DOCKET_NAME_BLOCKLIST_HASHES }}
         run: |
-          if [ -z "${DOCKET_NAME_BLOCKLIST:-}" ]; then
-            echo "::error::DOCKET_NAME_BLOCKLIST secret is not set. The privacy name check cannot run, so publication is blocked. The repo owner must paste the blocklist into the repository secret (Settings > Secrets and variables > Actions). NEVER commit the blocklist file to the repo."
+          if [ -z "${DOCKET_NAME_BLOCKLIST_HASHES:-}" ]; then
+            echo "::error::DOCKET_NAME_BLOCKLIST_HASHES secret is not set. The privacy name check cannot run, so publication is blocked. The repo owner must paste the provision-blocklist-hashes.py output into the repository secret (Settings > Secrets and variables > Actions). NEVER commit names or the hashes file to the repo."
             exit 1
           fi
-          printf '%s' "$DOCKET_NAME_BLOCKLIST" > /tmp/blocklist.txt
-          echo "Blocklist materialized (${#DOCKET_NAME_BLOCKLIST} chars); the file itself is never committed."
+          printf '%s' "$DOCKET_NAME_BLOCKLIST_HASHES" > /tmp/blocklist-hashes.txt
+          echo "Blocklist hashes materialized (${#DOCKET_NAME_BLOCKLIST_HASHES} chars); values are never echoed."
 
       - name: Run the publication validator (TRUSTED base copy)
         id: gate
@@ -162,7 +172,7 @@ jobs:
             --repo "$GITHUB_WORKSPACE" \
             --manifest publication-manifest.json \
             --changed-files-file /tmp/changed.txt \
-            --blocklist /tmp/blocklist.txt \
+            --blocklist-hashes /tmp/blocklist-hashes.txt \
             --types /tmp/trusted-gate/filing-types.json \
             --base-ref origin/master \
             --output /tmp/verdict.json
@@ -191,6 +201,6 @@ jobs:
                   print(f"- {r[:400]}")
           EOF
 
-      - name: Scrub the blocklist from the runner
+      - name: Scrub the blocklist hashes from the runner
         if: always()
-        run: shred -u /tmp/blocklist.txt 2>/dev/null || rm -f /tmp/blocklist.txt
+        run: shred -u /tmp/blocklist-hashes.txt 2>/dev/null || rm -f /tmp/blocklist-hashes.txt
