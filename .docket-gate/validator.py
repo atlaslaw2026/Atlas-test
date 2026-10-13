@@ -959,3 +959,5 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# T6: gate-only comment change (smoke-check test) - appended line.
