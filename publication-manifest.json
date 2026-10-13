@@ -1,0 +1,28 @@
+{
+ "record_type": "order",
+ "record_id": "O-PROBE-001",
+ "classification": "public",
+ "files": [
+  {
+   "path": "law/orders/O-PROBE-001.md",
+   "role": "primary"
+  },
+  {
+   "path": "law/orders/O-SEED-ONE.md",
+   "role": "authority"
+  },
+  {
+   "path": "law/orders/INDEX.json",
+   "role": "index"
+  }
+ ],
+ "authority_refs": [
+  "O-SEED-ONE"
+ ],
+ "authorization_receipt": {
+  "authorized_by": "Clinton Brown",
+  "authority": "Synthetic test authority 2026-10-12",
+  "authorized_at": "2026-10-12T10:00:00+00:00",
+  "content_sha256": "6be6479c2cdbd8691b94e38558d7cc4aee11b8bca48eaffcced23e374aca0406"
+ }
+}
