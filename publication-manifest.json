@@ -1,0 +1,28 @@
+{
+ "record_type": "order",
+ "record_id": "O-T4-001",
+ "classification": "public",
+ "files": [
+  {
+   "path": "law/orders/O-T4-001.md",
+   "role": "primary"
+  },
+  {
+   "path": "law/orders/O-SEED-ONE.md",
+   "role": "authority"
+  },
+  {
+   "path": "law/orders/INDEX.json",
+   "role": "index"
+  }
+ ],
+ "authority_refs": [
+  "O-SEED-ONE"
+ ],
+ "authorization_receipt": {
+  "authorized_by": "Clinton Brown",
+  "authority": "Synthetic test authority 2026-10-12",
+  "authorized_at": "2026-10-12T10:00:00+00:00",
+  "content_sha256": "0ead4c681d5937ed9a282a2321fc9ed5a32033b079d07fbe4d47e152c2f5b6eb"
+ }
+}
