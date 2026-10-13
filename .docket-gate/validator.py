@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Atlas Public Docket - publication gate validator (v1.2.1).
+"""Atlas Public Docket - publication gate validator (v1.2.2).
+
+v1.2.2 changes vs v1.2.1: the name blocklist may be supplied as salted hashes
+(--blocklist-hashes) instead of plaintext names. The validator recomputes
+HMAC-SHA256(salt, candidate) over sliding word-windows of the filing text, so
+plaintext names never exist on the CI runner. Matching semantics are identical
+to the v1.2.1 word-boundary case-insensitive regex (lowercase-only, no
+whitespace collapsing: "Firstname  Lastname" with two spaces does NOT match, same
+as the v1.2.1 literal-space regex). At least one of --blocklist /
+--blocklist-hashes is required; fail closed otherwise. All other checks are
+byte-identical to v1.2.1.
 
 v1.2.1 changes vs v1.1.0: blocklisted-name echoes redacted from all emitted
 output (findings, detail lines, verdict JSON). Detection conditions,
@@ -14,6 +24,7 @@ of the HUMAN ORDER "PUBLIC DOCKET MECHANICAL ENFORCEMENT REPAIR".
 Usage:
     validator.py --repo <repo-root> --manifest <publication-manifest.json>
                  --changed-files-file <file> [--blocklist <file>]
+                 [--blocklist-hashes <file>]
                  [--allow-no-git] [--types <filing-types.json>] [--output <verdict.json>]
 
 Exit codes: 0 = PASS (publishable), 2 = BLOCK (not publishable),
@@ -41,6 +52,7 @@ What the validator CANNOT do (documented, not hidden):
 
 import argparse
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -75,6 +87,15 @@ CREDENTIAL_ASSIGN_RE = re.compile(
 )
 HIGH_ENTROPY_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_-]{24,}")
 ENTROPY_THRESHOLD = 4.6  # above the max entropy of hex (4.0); catches base64-ish secrets
+
+# v1.2.2: word tokenizer for the salted-hash name matcher. Words are maximal
+# \w+ runs -- the same definition the (?<!\w)/(?!\w) lookarounds in the
+# v1.2.1 plaintext regex rely on, so boundary behavior is identical.
+HASH_WORD_RE = re.compile(r"\w+")
+# Upper bound on blocklisted-name length in words for the sliding window.
+# Person names beyond 8 words are not covered by the hash path (the plaintext
+# --blocklist path has no such cap).
+MAX_HASH_NAME_WORDS = 8
 
 # Citation patterns extracted from filing text (unioned with manifest refs).
 ORDER_REF_RE = re.compile(r"\bO-[A-Z0-9][A-Z0-9-]{2,}\b")
@@ -121,12 +142,17 @@ def utcnow_iso():
 
 class Validator:
     def __init__(self, repo, manifest, changed_files, blocklist_names,
-                 types, allow_no_git=False, base_ref="origin/master"):
+                 types, allow_no_git=False, base_ref="origin/master",
+                 blocklist_hashes=None):
         self.repo = os.path.abspath(repo)
         self.manifest = manifest
         self.manifest_path = None
         self.changed_files = set(changed_files)
         self.blocklist = blocklist_names  # None => fail closed
+        # (salt_bytes, {hexhmac: severity}) or None. When present, the hash
+        # path below replaces the plaintext name loop; plaintext names are
+        # never available to this process.
+        self.blocklist_hashes = blocklist_hashes
         self.types = types
         self.allow_no_git = allow_no_git
         # Uniqueness / non-duplication are evaluated against the BASE ref
@@ -570,9 +596,49 @@ class Validator:
             "waiver_justification": (waiver or {}).get("justification") if waived else None,
         })
 
+    def _scan_text_hash_names(self, text, location):
+        """v1.2.2: match blocklisted names without knowing them.
+
+        Parity argument vs the v1.2.1 plaintext regex
+        ``(?<!\\w)<re.escape(name)>(?!\\w)`` with IGNORECASE:
+        - Words are maximal \\w+ runs, so the character before words[i].start
+          and after words[j].end is never a \\w char -- exactly the two
+          lookaround conditions.
+        - Candidates are lowercased but NOT whitespace-collapsed: the v1.2.1
+          regex matches a literal single space, so a doubled internal space
+          does not match there and must not match here.
+        - The provisioner stores HMAC-SHA256(salt, lowercase(name)); we store
+          only (salt, {digest: severity}), so a match reveals nothing about
+          the name. `matched` is ALWAYS the redaction marker.
+        """
+        salt, table = self.blocklist_hashes
+        lowered = text.lower()
+        words = [(m.start(), m.end()) for m in HASH_WORD_RE.finditer(lowered)]
+        seen = set()
+        n = len(words)
+        for i in range(n):
+            for j in range(i, min(n, i + MAX_HASH_NAME_WORDS)):
+                cand = lowered[words[i][0]:words[j][1]]
+                digest = hmac.new(salt, cand.encode("utf-8"),
+                                  hashlib.sha256).hexdigest()
+                if digest in table and digest not in seen:
+                    seen.add(digest)
+                    sev = table[digest]
+                    cat = ("private-name" if sev == "fail"
+                           else "ambiguous-name-token")
+                    # The waiver check inside _add_finding runs on the marker;
+                    # no name-keyed waiver can match it, so hash findings are
+                    # never waived -- they block, same as unwaived v1.2.1 hits.
+                    self._add_finding(cat, self.REDACTED_MARKER, location, sev)
+
     def _scan_text(self, text, location):
         # 1. blocklisted names
-        if self.blocklist is None:
+        if self.blocklist_hashes is not None:
+            # v1.2.2 salted-hash path: plaintext names are unavailable; match
+            # by recomputing HMACs over sliding word-windows (see
+            # _scan_text_hash_names for the parity argument).
+            self._scan_text_hash_names(text, location)
+        elif self.blocklist is None:
             self._add_finding("blocklist-unavailable",
                               "no blocklist supplied", location, "review")
         else:
@@ -605,11 +671,12 @@ class Validator:
             self._add_finding("private-path", m.group(0), location, "fail")
 
     def check_privacy_scan(self):
-        if self.blocklist is None:
+        if self.blocklist is None and self.blocklist_hashes is None:
             self.check("privacy-scan", "review",
-                       "No name blocklist available (no --blocklist file and no "
-                       "DOCKET_NAME_BLOCKLIST env). The name check cannot run, so the "
-                       "filing cannot be proven name-clean. Supply the blocklist.")
+                       "No name blocklist available (no --blocklist file, no "
+                       "--blocklist-hashes file, and no DOCKET_NAME_BLOCKLIST env). "
+                       "The name check cannot run, so the filing cannot be proven "
+                       "name-clean. Supply the blocklist.")
             # still run the pattern scans below
         for f in self.manifest["files"]:
             p = f["path"]
@@ -895,6 +962,38 @@ def load_blocklist(path, env_value):
     return None  # fail closed: validator blocks without a blocklist
 
 
+def load_blocklist_hashes(path):
+    """v1.2.2: parse a provision-blocklist-hashes.py secret file.
+
+    Format: line 1 `salt:<hex>`, then `<severity>:<hexhmac>` per name.
+    Returns (salt_bytes, {hexhmac: severity}) or None if the file is
+    missing/malformed -- the caller then falls back to the plaintext path
+    and ultimately fail-closes.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    salt = None
+    table = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("salt:") and salt is None:
+                    salt = bytes.fromhex(line.split(":", 1)[1].strip())
+                elif ":" in line:
+                    sev, digest = line.split(":", 1)
+                    sev, digest = sev.strip(), digest.strip().lower()
+                    if sev in ("fail", "review") and digest:
+                        table[digest] = sev
+    except (OSError, ValueError):
+        return None
+    if salt is None or not table:
+        return None
+    return salt, table
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Atlas public-docket publication gate validator.")
     ap.add_argument("--repo", required=True, help="Repo working tree (PR head checkout).")
@@ -906,6 +1005,11 @@ def main(argv=None):
     ap.add_argument("--blocklist", default=None,
                     help="Path to person-names.blocklist. NEVER commit this file to the "
                          "public repo; in CI it is materialized from a secret.")
+    ap.add_argument("--blocklist-hashes", default=None,
+                    help="v1.2.2 alternative: path to a provision-blocklist-hashes.py "
+                         "secret file (salt + HMAC-SHA256 per name). At least one of "
+                         "--blocklist / --blocklist-hashes is required; the validator "
+                         "fails closed otherwise. NEVER commit this file.")
     ap.add_argument("--types", default=None,
                     help="filing-types.json path (default: alongside validator.py).")
     ap.add_argument("--allow-no-git", action="store_true",
@@ -944,9 +1048,11 @@ def main(argv=None):
             return 1
 
     blocklist = load_blocklist(args.blocklist, os.environ.get("DOCKET_NAME_BLOCKLIST"))
+    blocklist_hashes = load_blocklist_hashes(args.blocklist_hashes)
 
     v = Validator(args.repo, manifest, changed, blocklist, types,
-                  allow_no_git=args.allow_no_git, base_ref=args.base_ref)
+                  allow_no_git=args.allow_no_git, base_ref=args.base_ref,
+                  blocklist_hashes=blocklist_hashes)
     v.manifest_path = args.manifest
     verdict = v.run()
     out = json.dumps(verdict, indent=2, ensure_ascii=False)
